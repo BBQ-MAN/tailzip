@@ -1,0 +1,20 @@
+[package]
+name = "tailzip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36"
+rfd = "0.17"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+tar = "0.4"
+flate2 = "1"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "util"] }
+sys-locale = "0.3"
+image ={ version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+
+[build-dependencies]
+embed-resource = "3"

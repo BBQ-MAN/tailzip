@@ -1,0 +1,33 @@
+# build output
+/app/target/
+/dist/
+*.orig-blue
+.DS_Store
+
+# packaging intermediates
+/packaging/*.iconset/
+/packaging/icon_src_blue_old.png
+
+# local research notes and tool workspace (not part of the app)
+/investigation.cany/
+/capture/
+/checks/
+/reference/
+/pinned/
+/inbox/
+/graft/
+/craft.json
+/feed.json
+/usage.json
+/build-activity.log
+/app/MECHANICS.md
+/app/mechanics.json
+/app/shots/
+/app/I18N_REPORT.md
+/app/graft/
+/packaging/build-all.sh
+/packaging/screenshots.sh
+/dist/.DS_Store
+/packaging/tailzip
+/app/.gitignore
+/app/.ignore
