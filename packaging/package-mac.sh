@@ -23,6 +23,7 @@ B="$DIST/$NAME.app"; rm -rf "$B"
 mkdir -p "$B/Contents/MacOS" "$B/Contents/Resources/en.lproj" "$B/Contents/Resources/ko.lproj"
 cp $OUT/$BIN "$B/Contents/MacOS/$BIN"; rm -rf $OUT
 cp $PK/AppIcon.icns "$B/Contents/Resources/AppIcon.icns"
+cp $ROOT/THIRD_PARTY_NOTICES.md $ROOT/LICENSE "$B/Contents/Resources/"
 sed "s/@VERSION@/$VER/g" $PK/Info.plist.in > "$B/Contents/Info.plist"
 printf 'CFBundleName = "tailzip";\nCFBundleDisplayName = "tailzip";\n' > "$B/Contents/Resources/en.lproj/InfoPlist.strings"
 printf 'CFBundleName = "꼬리집";\nCFBundleDisplayName = "꼬리집";\n' > "$B/Contents/Resources/ko.lproj/InfoPlist.strings"

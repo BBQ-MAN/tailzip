@@ -6,8 +6,10 @@ mod i18n;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 
-use archive::{Entry, Kind};
+use archive::{Entry, Error, Kind, NewOpts, Res, PROGRESS};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use i18n::{tr, trf, Lang};
 
@@ -91,12 +93,7 @@ fn main() -> eframe::Result {
         APP_NAME,
         opts,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
-            let mut vis = egui::Visuals::light();
-            vis.selection.bg_fill = Color32::from_rgb(0xFB, 0xD3, 0xB4);
-            vis.selection.stroke = Stroke::new(1.0, ACCENT);
-            vis.hyperlink_color = ACCENT;
-            cc.egui_ctx.set_visuals(vis);
+            setup_style(&cc.egui_ctx);
             let mut app = App {
                 shot,
                 ..App::default()
@@ -107,6 +104,15 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn setup_style(ctx: &egui::Context) {
+    setup_fonts(ctx);
+    let mut vis = egui::Visuals::light();
+    vis.selection.bg_fill = Color32::from_rgb(0xFB, 0xD3, 0xB4);
+    vis.selection.stroke = Stroke::new(1.0, ACCENT);
+    vis.hyperlink_color = ACCENT;
+    ctx.set_visuals(vis);
 }
 
 /// Add a system font with Korean/Chinese/Japanese glyphs as a fallback so such file names render.
@@ -135,6 +141,10 @@ struct Opened {
     path: PathBuf,
     kind: Kind,
     entries: Vec<Entry>,
+    /// Kept in memory only while this archive is open; never saved or logged.
+    password: Option<String>,
+    /// Bytes on disk, all volumes (RAR does not report packed sizes per file).
+    disk_size: u64,
 }
 
 struct NewDlg {
@@ -144,6 +154,37 @@ struct NewDlg {
     inputs: Vec<PathBuf>,
     /// true = "Add" to the open archive instead of creating a new one.
     add_to_open: bool,
+    use_pw: bool,
+    pw: String,
+    pw2: String,
+    show_pw: bool,
+    zip_crypto: bool,
+    encrypt_names: bool,
+    split: bool,
+    /// Index into VOLUME_PRESETS.
+    preset: usize,
+    custom_mb: u32,
+}
+
+/// Volume sizes in MiB; 0 = custom.
+const VOLUME_PRESETS: [(&str, u64); 5] = [
+    ("10 MB", 10),
+    ("100 MB", 100),
+    ("700 MB (CD)", 700),
+    ("4 GB (FAT32)", 4095),
+    ("Custom", 0),
+];
+
+/// Retried with the password the user typed.
+type Retry = Box<dyn FnOnce(&mut App, String)>;
+/// Runs on the UI thread with a finished job's result.
+type Then = Box<dyn FnOnce(&mut App, Res<usize>)>;
+
+/// A long operation on a worker thread; `then` runs on the UI thread with its result.
+struct Job {
+    title: String,
+    rx: mpsc::Receiver<Res<usize>>,
+    then: Then,
 }
 
 enum Dialog {
@@ -155,6 +196,12 @@ enum Dialog {
         only: Option<Vec<String>>,
     },
     ConfirmDelete(Vec<String>),
+    Password {
+        input: String,
+        show: bool,
+        wrong: bool,
+        retry: Option<Retry>,
+    },
     Settings,
     About,
 }
@@ -177,6 +224,7 @@ struct App {
     show_status: bool,
     frame_no: u32,
     shot: Option<PathBuf>,
+    job: Option<Job>,
 }
 
 impl Default for App {
@@ -196,6 +244,7 @@ impl Default for App {
             show_status: true,
             frame_no: 0,
             shot: None,
+            job: None,
         }
     }
 }
@@ -242,35 +291,155 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
-        match archive::list(&path) {
+        self.open_pw(path, None);
+    }
+
+    fn open_pw(&mut self, path: PathBuf, password: Option<String>) {
+        match archive::list(&path, password.as_deref()) {
             Ok((kind, entries)) => {
                 self.recent.retain(|p| p != &path);
                 self.recent.insert(0, path.clone());
                 self.recent.truncate(10);
+                let disk_size = archive::volumes(&path)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|v| std::fs::metadata(v).ok())
+                    .map(|m| m.len())
+                    .sum();
                 self.opened = Some(Opened {
                     path,
                     kind,
                     entries,
+                    password,
+                    disk_size,
                 });
                 self.cwd.clear();
                 self.selected.clear();
                 self.anchor = None;
                 self.filter.clear();
             }
-            Err(e) => self.msg(
-                tr("Open Archive"),
-                trf(
-                    "Cannot open {path}:\n{e}",
-                    &[("path", &path.display()), ("e", &e)],
-                ),
-            ),
+            Err(e) => {
+                let p = path.clone();
+                if !self.ask_password(&e, move |app, pw| app.open_pw(p, Some(pw))) {
+                    self.msg(
+                        tr("Open Archive"),
+                        trf(
+                            "Cannot open {path}:\n{e}",
+                            &[("path", &path.display()), ("e", &e)],
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Show the password prompt for password errors; `retry` runs with the typed password.
+    fn ask_password(&mut self, e: &Error, retry: impl FnOnce(&mut App, String) + 'static) -> bool {
+        let wrong = match e {
+            Error::NeedPassword => false,
+            Error::WrongPassword => true,
+            _ => return false,
+        };
+        self.dialog = Dialog::Password {
+            input: String::new(),
+            show: false,
+            wrong,
+            retry: Some(Box::new(retry)),
+        };
+        true
+    }
+
+    fn set_password(&mut self, pw: String) {
+        if let Some(o) = &mut self.opened {
+            o.password = Some(pw);
+        }
+    }
+
+    /// Path and password of the open archive.
+    fn target(&self) -> Option<(PathBuf, Option<String>)> {
+        self.opened
+            .as_ref()
+            .map(|o| (o.path.clone(), o.password.clone()))
+    }
+
+    /// Why Add/Delete are unavailable for the open archive, if they are.
+    fn edit_block(&self) -> Option<&'static str> {
+        self.opened
+            .as_ref()
+            .and_then(|o| archive::edit_block(&o.path, o.kind))
+    }
+
+    /// Run `work` on a worker thread with a progress window; `then` gets the result.
+    fn run_job(
+        &mut self,
+        title: &str,
+        total: usize,
+        work: impl FnOnce() -> Res<usize> + Send + 'static,
+        then: impl FnOnce(&mut App, Res<usize>) + 'static,
+    ) {
+        if self.job.is_some() {
+            return;
+        }
+        PROGRESS.reset(total);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        self.job = Some(Job {
+            title: title.into(),
+            rx,
+            then: Box::new(then),
+        });
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        let r = match job.rx.try_recv() {
+            Ok(r) => r,
+            // The worker died (a library panicked): report instead of crashing.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(Error::Msg(tr("The operation failed unexpectedly.").into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                let (done, total) = (
+                    PROGRESS.done.load(Ordering::Relaxed),
+                    PROGRESS.total.load(Ordering::Relaxed),
+                );
+                egui::Modal::new(egui::Id::new("job")).show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.heading(job.title.as_str());
+                    ui.add_space(6.0);
+                    let frac = if total > 0 {
+                        done.min(total) as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(trf(
+                                "{done} / {total} file(s)",
+                                &[("done", &done), ("total", &total)],
+                            ))
+                            .animate(true),
+                    );
+                    ui.add_space(8.0);
+                    if ui.button(format!("   {}   ", tr("Cancel"))).clicked() {
+                        PROGRESS.cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+        };
+        if let Some(job) = self.job.take() {
+            (job.then)(self, r);
         }
     }
 
     fn reload(&mut self) {
         let Some(o) = &self.opened else { return };
-        let (path, cwd) = (o.path.clone(), self.cwd.clone());
-        self.open(path);
+        let (path, cwd, pw) = (o.path.clone(), self.cwd.clone(), o.password.clone());
+        self.open_pw(path, pw);
         if let Some(o) = &self.opened {
             if o.entries.iter().any(|e| e.is_dir && e.path == cwd) {
                 self.cwd = cwd;
@@ -286,7 +455,13 @@ impl App {
 
     fn pick_open(&mut self) {
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter(tr("Archives"), &["zip", "7z", "tar", "tgz", "gz"])
+            .add_filter(
+                tr("Archives"),
+                &[
+                    "zip", "zipx", "7z", "rar", "alz", "egg", "tar", "tgz", "gz", "001", "z01",
+                    "a00", "r00",
+                ],
+            )
             .add_filter(tr("All files"), &["*"])
             .pick_file()
         {
@@ -310,6 +485,15 @@ impl App {
             level: self.default_level,
             inputs,
             add_to_open: false,
+            use_pw: false,
+            pw: String::new(),
+            pw2: String::new(),
+            show_pw: false,
+            zip_crypto: false,
+            encrypt_names: false,
+            split: false,
+            preset: 0,
+            custom_mb: 50,
         });
     }
 
@@ -317,22 +501,34 @@ impl App {
         if self.opened.is_none() {
             return;
         }
-        self.dialog = Dialog::New(NewDlg {
-            out: String::new(),
-            kind: Kind::Zip,
-            level: self.default_level,
-            inputs,
-            add_to_open: true,
-        });
+        if let Some(why) = self.edit_block() {
+            self.msg(tr("Add"), why);
+            return;
+        }
+        self.start_new(inputs);
+        if let Dialog::New(d) = &mut self.dialog {
+            d.out.clear();
+            d.kind = Kind::Zip;
+            d.add_to_open = true;
+        }
+    }
+
+    fn start_delete(&mut self) {
+        if let Some(why) = self.edit_block() {
+            self.msg(tr("Delete"), why);
+        } else if !self.selected.is_empty() {
+            self.dialog = Dialog::ConfirmDelete(self.selected_paths());
+        }
     }
 
     fn start_extract(&mut self, only: Option<Vec<String>>) {
         let Some(o) = &self.opened else { return };
         // Default destination: a folder named after the archive, next to it.
-        let stem = o.path.file_name().unwrap_or_default().to_string_lossy();
-        let stem = stem.trim_end_matches(".gz").trim_end_matches(".tar");
-        let stem = stem.rsplit_once('.').map(|(a, _)| a).unwrap_or(stem);
-        let dest = o.path.parent().unwrap_or(Path::new(".")).join(stem);
+        let dest = o
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(archive::base_name(&o.path));
         self.dialog = Dialog::Extract {
             dest: dest.display().to_string(),
             only,
@@ -343,26 +539,171 @@ impl App {
         let Some(o) = &self.opened else { return vec![] };
         self.selected
             .iter()
-            .map(|&i| o.entries[i].path.clone())
+            .filter_map(|&i| o.entries.get(i))
+            .map(|e| e.path.clone())
             .collect()
     }
 
+    /// Files under the given archive paths (all files when None), for the progress bar.
+    fn file_count(&self, only: Option<&[String]>) -> usize {
+        let Some(o) = &self.opened else { return 0 };
+        o.entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .filter(|e| {
+                only.is_none_or(|sel| {
+                    sel.iter()
+                        .any(|s| e.path == *s || e.path.starts_with(&format!("{s}/")))
+                })
+            })
+            .count()
+    }
+
     fn test_archive(&mut self) {
-        let Some(o) = &self.opened else { return };
-        let r = archive::test(&o.path);
-        match r {
-            Ok(n) => self.msg(
-                tr("Test"),
-                trf(
-                    "No errors found in this archive.\n{n} file(s) tested.",
-                    &[("n", &n)],
+        let Some((path, pw)) = self.target() else {
+            return;
+        };
+        let total = self.file_count(None);
+        self.run_job(
+            tr("Test"),
+            total,
+            move || archive::test(&path, pw.as_deref()),
+            |app, r| match r {
+                Ok(n) => app.msg(
+                    tr("Test"),
+                    trf(
+                        "No errors found in this archive.\n{n} file(s) tested.",
+                        &[("n", &n)],
+                    ),
                 ),
-            ),
-            Err(e) => self.msg(
-                tr("Test"),
-                trf("Errors were found in this archive:\n{e}", &[("e", &e)]),
-            ),
-        }
+                Err(e) => {
+                    if !app.ask_password(&e, |app, pw| {
+                        app.set_password(pw);
+                        app.test_archive();
+                    }) {
+                        app.msg(
+                            tr("Test"),
+                            trf("Errors were found in this archive:\n{e}", &[("e", &e)]),
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_extract(&mut self, dest: PathBuf, only: Option<Vec<String>>) {
+        let Some((path, pw)) = self.target() else {
+            return;
+        };
+        let total = self.file_count(only.as_deref());
+        let (d, o) = (dest.clone(), only.clone());
+        self.run_job(
+            tr("Extract"),
+            total,
+            move || archive::extract(&path, &d, o.as_deref(), pw.as_deref()),
+            move |app, r| match r {
+                Ok(n) => {
+                    app.msg(
+                        tr("Extract"),
+                        trf(
+                            "Extraction completed successfully.\n{n} file(s) extracted.",
+                            &[("n", &n)],
+                        ),
+                    );
+                    open_with_system(&dest);
+                }
+                Err(e) => {
+                    if !app.ask_password(&e, move |app, pw| {
+                        app.set_password(pw);
+                        app.do_extract(dest, only);
+                    }) {
+                        app.msg(
+                            tr("Extract"),
+                            trf("Extraction has failed.\n({e})", &[("e", &e)]),
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_delete(&mut self, sel: Vec<String>) {
+        let Some((path, pw)) = self.target() else {
+            return;
+        };
+        self.run_job(
+            tr("Delete"),
+            0,
+            {
+                let sel = sel.clone();
+                move || archive::delete(&path, &sel, pw.as_deref()).map(|_| 0)
+            },
+            |app, r| match r {
+                Ok(_) => app.reload(),
+                Err(e) => {
+                    if !app.ask_password(&e, |app, pw| {
+                        app.set_password(pw);
+                        app.do_delete(sel);
+                    }) {
+                        app.msg(tr("Delete"), e);
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_add(&mut self, inputs: Vec<PathBuf>, level: u8) {
+        let Some((path, pw)) = self.target() else {
+            return;
+        };
+        let cwd = self.cwd.clone();
+        self.run_job(
+            tr("Add"),
+            0,
+            {
+                let inputs = inputs.clone();
+                move || archive::add(&path, &inputs, &cwd, level, pw.as_deref()).map(|_| 0)
+            },
+            move |app, r| match r {
+                Ok(_) => app.reload(),
+                Err(e) => {
+                    if !app.ask_password(&e, move |app, pw| {
+                        app.set_password(pw);
+                        app.do_add(inputs, level);
+                    }) {
+                        app.msg(tr("Add"), e);
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_create(
+        &mut self,
+        out: PathBuf,
+        kind: Kind,
+        inputs: Vec<PathBuf>,
+        level: u8,
+        opts: NewOpts,
+    ) {
+        let split = opts.volume_size.is_some();
+        let o = out.clone();
+        self.run_job(
+            tr("New Archive"),
+            0,
+            move || archive::create(&o, kind, &inputs, level, &opts),
+            move |app, r| match r {
+                Ok(_) => {
+                    app.open(if split {
+                        archive::volume_path(&out, 0)
+                    } else {
+                        out
+                    });
+                    app.msg(tr("New Archive"), tr("Archiving completed successfully."));
+                }
+                Err(e) => app.msg(tr("New Archive"), e),
+            },
+        );
     }
 
     /// Rows shown in the list: children of the current folder, or all matches while searching.
@@ -391,7 +732,7 @@ impl App {
     /// Double-click: enter a folder, or extract a file to a temp folder and open it.
     fn activate(&mut self, idx: usize) {
         let Some(o) = &self.opened else { return };
-        let e = &o.entries[idx];
+        let Some(e) = o.entries.get(idx) else { return };
         if e.is_dir {
             self.cwd = e.path.clone();
             self.selected.clear();
@@ -399,10 +740,22 @@ impl App {
             return;
         }
         let tmp = std::env::temp_dir().join(format!("archiver-{}", std::process::id()));
-        let (path, inner) = (o.path.clone(), e.path.clone());
-        match archive::extract(&path, &tmp, Some(std::slice::from_ref(&inner))) {
+        let (path, inner, pw) = (o.path.clone(), e.path.clone(), o.password.clone());
+        match archive::extract(
+            &path,
+            &tmp,
+            Some(std::slice::from_ref(&inner)),
+            pw.as_deref(),
+        ) {
             Ok(_) => open_with_system(&tmp.join(&inner)),
-            Err(e) => self.msg(tr("Open"), e),
+            Err(e) => {
+                if !self.ask_password(&e, move |app, pw| {
+                    app.set_password(pw);
+                    app.activate(idx);
+                }) {
+                    self.msg(tr("Open"), e);
+                }
+            }
         }
     }
 
@@ -449,21 +802,28 @@ impl App {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            let block = self.edit_block();
+            let why = block.unwrap_or_default();
             ui.menu_button(tr("Edit"), |ui| {
                 if ui
-                    .add_enabled(has, egui::Button::new(tr("Add Files...")))
+                    .add_enabled(
+                        has && block.is_none(),
+                        egui::Button::new(tr("Add Files...")),
+                    )
+                    .on_disabled_hover_text(why)
                     .clicked()
                 {
                     self.pick_add();
                 }
                 if ui
                     .add_enabled(
-                        has && !self.selected.is_empty(),
+                        has && block.is_none() && !self.selected.is_empty(),
                         item(tr("Delete Files"), "Del"),
                     )
+                    .on_disabled_hover_text(why)
                     .clicked()
                 {
-                    self.dialog = Dialog::ConfirmDelete(self.selected_paths());
+                    self.start_delete();
                 }
                 if ui
                     .add_enabled(has, item(tr("Select All"), "Ctrl+A"))
@@ -528,12 +888,13 @@ impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         // Toolbar buttons in order: Open, Extract, New, Add, Delete, Test.
         let sel = !self.selected.is_empty();
+        let block = self.edit_block();
         let buttons: [(&str, &str, bool); 6] = [
             ("🗁", tr("Open"), true),
             ("📤", tr("Extract"), true),
             ("🗋", tr("New"), true),
-            ("➕", tr("Add"), true),
-            ("🗑", tr("Delete"), sel),
+            ("➕", tr("Add"), block.is_none()),
+            ("🗑", tr("Delete"), sel && block.is_none()),
             ("✔", tr("Test"), true),
         ];
         ui.horizontal(|ui| {
@@ -553,7 +914,11 @@ impl App {
                     Vec2::new((text_w + 14.0).max(64.0), 56.0),
                     Sense::click(),
                 );
-                let resp = resp.on_hover_text(label);
+                // Disabled Add/Delete explain why (read-only format or split archive).
+                let resp = match block {
+                    Some(why) if !enabled && (i == 3 || i == 4) => resp.on_hover_text(why),
+                    _ => resp.on_hover_text(label),
+                };
                 let col = if enabled {
                     Color32::from_rgb(0x30, 0x30, 0x30)
                 } else {
@@ -584,7 +949,7 @@ impl App {
                         1 => self.start_extract(sel.then(|| self.selected_paths())),
                         2 => self.start_new(vec![]),
                         3 => self.pick_add(),
-                        4 => self.dialog = Dialog::ConfirmDelete(self.selected_paths()),
+                        4 => self.start_delete(),
                         _ => self.test_archive(),
                     }
                 }
@@ -785,6 +1150,7 @@ impl App {
 
     fn file_list(&mut self, ui: &mut egui::Ui) {
         let rows = self.rows();
+        let editable = self.edit_block().is_none();
         let Some(o) = &self.opened else { return };
         let text = Color32::from_gray(25);
         let font = FontId::proportional(13.0);
@@ -866,7 +1232,8 @@ impl App {
                     };
                     let cells = [
                         format!("{icon} {name}"),
-                        if e.is_dir {
+                        // RAR does not report packed sizes per file.
+                        if e.is_dir || (e.packed == 0 && e.size > 0) {
                             String::new()
                         } else {
                             human(e.packed)
@@ -906,7 +1273,10 @@ impl App {
                         if ui.button(tr("Extract selected files...")).clicked() {
                             ctx_extract = true;
                         }
-                        if ui.button(tr("Delete")).clicked() {
+                        if ui
+                            .add_enabled(editable, egui::Button::new(tr("Delete")))
+                            .clicked()
+                        {
                             ctx_delete = true;
                         }
                     });
@@ -942,7 +1312,7 @@ impl App {
             self.start_extract(Some(self.selected_paths()));
         }
         if ctx_delete {
-            self.dialog = Dialog::ConfirmDelete(self.selected_paths());
+            self.start_delete();
         }
     }
 
@@ -952,7 +1322,10 @@ impl App {
             if self.selected.is_empty() {
                 let files = o.entries.iter().filter(|e| !e.is_dir).count();
                 let size: u64 = o.entries.iter().map(|e| e.size).sum();
-                let packed: u64 = o.entries.iter().map(|e| e.packed).sum();
+                let packed: u64 = match o.entries.iter().map(|e| e.packed).sum() {
+                    0 => o.disk_size.min(size),
+                    p => p,
+                };
                 let ratio = if size > 0 {
                     100.0 - packed as f64 * 100.0 / size as f64
                 } else {
@@ -968,7 +1341,11 @@ impl App {
                     ],
                 ));
             } else {
-                let sel: Vec<&Entry> = self.selected.iter().map(|&i| &o.entries[i]).collect();
+                let sel: Vec<&Entry> = self
+                    .selected
+                    .iter()
+                    .filter_map(|&i| o.entries.get(i))
+                    .collect();
                 let files = sel.iter().filter(|e| !e.is_dir).count();
                 let dirs = sel.len() - files;
                 let size: u64 = sel.iter().map(|e| e.size).sum();
@@ -976,6 +1353,18 @@ impl App {
                     "{files} file(s), {dirs} folder(s) selected  ·  Selected file size: {size}",
                     &[("files", &files), ("dirs", &dirs), ("size", &human(size))],
                 ));
+            }
+            if o.password.is_some() || o.entries.iter().any(|e| e.encrypted) {
+                ui.separator();
+                ui.label(format!("🔒 {}", tr("Encrypted")));
+            }
+            if archive::is_split(&o.path) {
+                ui.separator();
+                ui.label(tr("Split archive"));
+            }
+            if o.kind.read_only() {
+                ui.separator();
+                ui.label(tr("Read-only format"));
             }
         });
     }
@@ -1001,7 +1390,7 @@ impl App {
                 egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
                     ui.set_min_width(340.0);
                     ui.heading(tr("tailzip"));
-                    ui.label(tr("Open, browse, extract and create ZIP, 7Z, TAR and TGZ archives."));
+                    ui.label(tr("Create ZIP, 7Z, TAR and TGZ archives; open and extract RAR, ZIPX, ALZ and EGG too."));
                     ui.label(tr("Runs on Windows and macOS."));
                     ui.add_space(6.0);
                     ui.label(tr("Tip: drag files onto the window to compress them, or drop an archive to open it."));
@@ -1009,6 +1398,61 @@ impl App {
                     if ui.button(format!("   {}   ", tr("OK"))).clicked() {
                         close = true;
                     }
+                });
+            }
+            Dialog::Password {
+                input,
+                show,
+                wrong,
+                retry,
+            } => {
+                egui::Modal::new(egui::Id::new("password")).show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.heading(tr("Enter Password"));
+                    ui.add_space(4.0);
+                    if *wrong {
+                        ui.colored_label(
+                            Color32::from_rgb(0xC0, 0x30, 0x20),
+                            tr("The password is incorrect. Try again."),
+                        );
+                    } else {
+                        ui.label(tr("This archive is encrypted. Enter the password."));
+                    }
+                    ui.add_space(6.0);
+                    let r = ui.horizontal(|ui| {
+                        ui.label(tr("Password:"));
+                        ui.add(
+                            egui::TextEdit::singleline(input)
+                                .password(!*show)
+                                .desired_width(240.0),
+                        )
+                    });
+                    let r = r.inner;
+                    if input.is_empty() && !r.has_focus() {
+                        r.request_focus();
+                    }
+                    ui.checkbox(show, tr("Show password"));
+                    ui.add_space(10.0);
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        let ok = ui
+                            .add_enabled(
+                                !input.is_empty(),
+                                egui::Button::new(format!("   {}   ", tr("OK"))),
+                            )
+                            .clicked();
+                        if (ok || (enter && !input.is_empty())) && retry.is_some() {
+                            let pw = std::mem::take(input);
+                            if let Some(f) = retry.take() {
+                                action = Some(Box::new(move |app: &mut App| f(app, pw)));
+                            }
+                        } else if ok {
+                            close = true;
+                        }
+                        if ui.button(format!("   {}   ", tr("Cancel"))).clicked() {
+                            close = true;
+                        }
+                    });
                 });
             }
             Dialog::Settings => {
@@ -1036,13 +1480,7 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button(format!("   {}   ", tr("Yes"))).clicked() {
-                            action = Some(Box::new(move |app: &mut App| {
-                                let path = app.opened.as_ref().map(|o| o.path.clone()).unwrap();
-                                match archive::delete(&path, &sel) {
-                                    Ok(()) => app.reload(),
-                                    Err(e) => app.msg(tr("Delete"), e),
-                                }
-                            }));
+                            action = Some(Box::new(move |app: &mut App| app.do_delete(sel)));
                         }
                         if ui.button(format!("   {}   ", tr("No"))).clicked() {
                             close = true;
@@ -1070,17 +1508,8 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button(format!("   {}   ", tr("Extract"))).clicked() {
                             let (dest, only) = (PathBuf::from(dest.clone()), only.clone());
-                            action = Some(Box::new(move |app: &mut App| {
-                                let path = app.opened.as_ref().map(|o| o.path.clone()).unwrap();
-                                // ponytail: runs on the UI thread; move to a worker with progress if huge archives freeze it.
-                                match archive::extract(&path, &dest, only.as_deref()) {
-                                    Ok(n) => {
-                                        app.msg(tr("Extract"), trf("Extraction completed successfully.\n{n} file(s) extracted.", &[("n", &n)]));
-                                        open_with_system(&dest);
-                                    }
-                                    Err(e) => app.msg(tr("Extract"), trf("Extraction has failed.\n({e})", &[("e", &e)])),
-                                }
-                            }));
+                            action =
+                                Some(Box::new(move |app: &mut App| app.do_extract(dest, only)));
                         }
                         if ui.button(format!("   {}   ", tr("Cancel"))).clicked() {
                             close = true;
@@ -1125,6 +1554,8 @@ impl App {
                                 .display()
                                 .to_string();
                         }
+                        ui.add_space(6.0);
+                        new_options(ui, d);
                     }
                     ui.add_space(6.0);
                     ui.label(trf("Files to add ({n}):", &[("n", &d.inputs.len())]));
@@ -1175,38 +1606,25 @@ impl App {
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let ok =
-                            !d.inputs.is_empty() && (d.add_to_open || !d.out.trim().is_empty());
+                        let ok = !d.inputs.is_empty()
+                            && (d.add_to_open || (!d.out.trim().is_empty() && d.pw_ok()));
                         if ui
                             .add_enabled(ok, egui::Button::new(format!("   {}   ", tr("Start"))))
                             .clicked()
                         {
-                            let (out, kind, level, inputs, add) = (
+                            let (out, kind, level, inputs, add, opts) = (
                                 PathBuf::from(d.out.trim()),
                                 d.kind,
                                 d.level,
                                 d.inputs.clone(),
                                 d.add_to_open,
+                                d.opts(),
                             );
                             action = Some(Box::new(move |app: &mut App| {
                                 if add {
-                                    let path = app.opened.as_ref().map(|o| o.path.clone()).unwrap();
-                                    let cwd = app.cwd.clone();
-                                    match archive::add(&path, &inputs, &cwd, level) {
-                                        Ok(()) => app.reload(),
-                                        Err(e) => app.msg(tr("Add"), e),
-                                    }
+                                    app.do_add(inputs, level);
                                 } else {
-                                    match archive::create(&out, kind, &inputs, level) {
-                                        Ok(_) => {
-                                            app.open(out);
-                                            app.msg(
-                                                tr("New Archive"),
-                                                tr("Archiving completed successfully."),
-                                            );
-                                        }
-                                        Err(e) => app.msg(tr("New Archive"), e),
-                                    }
+                                    app.do_create(out, kind, inputs, level, opts);
                                 }
                             }));
                         }
@@ -1226,7 +1644,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if !matches!(self.dialog, Dialog::None) {
+        if !matches!(self.dialog, Dialog::None) || self.job.is_some() {
             return;
         }
         let (o, n, w, f, del, all, back, f1) = ctx.input(|i| {
@@ -1262,7 +1680,7 @@ impl App {
             self.show_find = true;
         }
         if del && !self.selected.is_empty() {
-            self.dialog = Dialog::ConfirmDelete(self.selected_paths());
+            self.start_delete();
         }
         if all {
             self.selected = self.rows().into_iter().collect();
@@ -1361,6 +1779,109 @@ fn format_level_pickers(ui: &mut egui::Ui, kind: &mut Kind, level: &mut u8) {
             ui.add_enabled_ui(*kind != Kind::Tar, |ui| level_picker(ui, level));
             ui.end_row();
         });
+}
+
+impl NewDlg {
+    fn can_encrypt(&self) -> bool {
+        matches!(self.kind, Kind::Zip | Kind::SevenZ)
+    }
+
+    fn pw_ok(&self) -> bool {
+        !(self.use_pw && self.can_encrypt()) || (!self.pw.is_empty() && self.pw == self.pw2)
+    }
+
+    fn opts(&self) -> NewOpts {
+        let mb = match VOLUME_PRESETS.get(self.preset) {
+            Some(&(_, 0)) | None => self.custom_mb.max(1) as u64,
+            Some(&(_, mb)) => mb,
+        };
+        NewOpts {
+            password: (self.use_pw && self.can_encrypt()).then(|| self.pw.clone()),
+            zip_crypto: self.zip_crypto,
+            encrypt_names: self.encrypt_names,
+            volume_size: (self.split && self.can_encrypt()).then_some(mb * 1024 * 1024),
+        }
+    }
+}
+
+/// New Archive: password and split options (ZIP and 7Z only).
+fn new_options(ui: &mut egui::Ui, d: &mut NewDlg) {
+    let can = d.can_encrypt();
+    ui.add_enabled_ui(can, |ui| {
+        ui.checkbox(&mut d.use_pw, tr("Set password"))
+            .on_disabled_hover_text(tr("Passwords and volumes are available for ZIP and 7Z."));
+        if d.use_pw && can {
+            egui::Grid::new("pw")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(tr("Password:"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.pw)
+                            .password(!d.show_pw)
+                            .desired_width(220.0),
+                    );
+                    ui.end_row();
+                    ui.label(tr("Confirm password:"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut d.pw2)
+                            .password(!d.show_pw)
+                            .desired_width(220.0),
+                    );
+                    ui.end_row();
+                    if d.kind == Kind::Zip {
+                        ui.label(tr("Encryption:"));
+                        let name = |zc: bool| {
+                            if zc {
+                                tr("ZipCrypto (compatible)")
+                            } else {
+                                tr("AES-256 (recommended)")
+                            }
+                        };
+                        egui::ComboBox::from_id_salt("enc")
+                            .selected_text(name(d.zip_crypto))
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut d.zip_crypto, false, name(false));
+                                ui.selectable_value(&mut d.zip_crypto, true, name(true));
+                            });
+                        ui.end_row();
+                    }
+                });
+            ui.checkbox(&mut d.show_pw, tr("Show password"));
+            if d.kind == Kind::SevenZ {
+                ui.checkbox(&mut d.encrypt_names, tr("Encrypt file names"));
+            }
+            if !d.pw2.is_empty() && d.pw != d.pw2 {
+                ui.colored_label(
+                    Color32::from_rgb(0xC0, 0x30, 0x20),
+                    tr("The passwords do not match."),
+                );
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut d.split, tr("Split into volumes"));
+            if d.split && can {
+                ui.label(tr("Volume size:"));
+                egui::ComboBox::from_id_salt("vol")
+                    .selected_text(tr(VOLUME_PRESETS[d.preset.min(4)].0))
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _)) in VOLUME_PRESETS.iter().enumerate() {
+                            ui.selectable_value(&mut d.preset, i, tr(name));
+                        }
+                    });
+                if VOLUME_PRESETS[d.preset.min(4)].1 == 0 {
+                    ui.add(
+                        egui::DragValue::new(&mut d.custom_mb)
+                            .range(1..=1_000_000)
+                            .suffix(" MB"),
+                    );
+                }
+            }
+        });
+    });
 }
 
 /// Line icons on the start tiles: stacked pages with an arrow (open) or a zipper (new).
@@ -1473,7 +1994,62 @@ impl eframe::App for App {
                 });
         }
 
-        self.dialogs(&ctx);
+        if self.job.is_some() {
+            self.poll_job(&ctx);
+        } else {
+            self.dialogs(&ctx);
+        }
         self.screenshot(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    /// Renders the UI offscreen (no window or display needed) to `$TAILZIP_SHOTS/v2_<lang>_<view>.png`.
+    #[test]
+    #[ignore = "writes screenshots: TAILZIP_SHOTS=<dir> cargo test --release -- --ignored"]
+    fn ui_screenshots() {
+        let Some(dir) = std::env::var_os("TAILZIP_SHOTS").map(PathBuf::from) else {
+            return;
+        };
+        let fx = |n: &str| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(n)
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        for lang in Lang::ALL {
+            i18n::set(lang);
+            for view in ["new", "rar", "password"] {
+                let mut app = App::default();
+                match view {
+                    "new" => {
+                        app.start_new(vec![PathBuf::from("Documents"), PathBuf::from("photo.jpg")]);
+                        if let Dialog::New(d) = &mut app.dialog {
+                            d.kind = Kind::SevenZ;
+                            d.out = "Documents.7z".into();
+                            (d.use_pw, d.encrypt_names, d.split) = (true, true, true);
+                            d.pw = "Test1234".into();
+                            d.pw2 = "Test1234".into();
+                        }
+                    }
+                    "rar" => app.open(fx("rar5_enc.rar")),
+                    _ => app.open(fx("rar5_hdr.rar")),
+                }
+                let mut h = egui_kittest::Harness::builder()
+                    .with_size([930.0, 660.0])
+                    .wgpu()
+                    .build_eframe(|cc| {
+                        setup_style(&cc.egui_ctx);
+                        app
+                    });
+                h.run_steps(8);
+                let img = h.render().unwrap();
+                img.save(dir.join(format!("v2_{}_{view}.png", lang.code())))
+                    .unwrap();
+            }
+        }
     }
 }

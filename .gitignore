@@ -31,3 +31,7 @@
 /packaging/tailzip
 /app/.gitignore
 /app/.ignore
+/app/V2_REPORT.md
+# large upstream ALZ/EGG samples for optional tests (see THIRD_PARTY_NOTICES.md)
+/app/tests/cache/
+/.ignore

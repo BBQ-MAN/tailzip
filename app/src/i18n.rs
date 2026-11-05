@@ -204,8 +204,8 @@ const STRINGS: &[(&str, &str)] = &[
     ),
     ("OK", "확인"),
     (
-        "Open, browse, extract and create ZIP, 7Z, TAR and TGZ archives.",
-        "ZIP, 7Z, TAR, TGZ 압축 파일을 열고, 살펴보고, 풀고, 만듭니다.",
+        "Create ZIP, 7Z, TAR and TGZ archives; open and extract RAR, ZIPX, ALZ and EGG too.",
+        "ZIP, 7Z, TAR, TGZ 압축 파일을 만들고, RAR, ZIPX, ALZ, EGG 압축 파일도 열어서 풉니다.",
     ),
     (
         "Runs on Windows and macOS.",
@@ -261,6 +261,78 @@ const STRINGS: &[(&str, &str)] = &[
         "Unsupported archive format.",
         "지원하지 않는 압축 파일 형식입니다.",
     ),
+    // Passwords
+    ("Enter Password", "암호 입력"),
+    ("Password:", "암호:"),
+    ("Confirm password:", "암호 확인:"),
+    ("Show password", "암호 표시"),
+    ("Set password", "암호 설정"),
+    ("Encryption:", "암호화 방식:"),
+    ("AES-256 (recommended)", "AES-256 (권장)"),
+    ("ZipCrypto (compatible)", "ZipCrypto (호환용)"),
+    ("Encrypt file names", "파일 이름 암호화"),
+    ("Encrypted", "암호화됨"),
+    ("The passwords do not match.", "암호가 일치하지 않습니다."),
+    (
+        "This archive is encrypted. Enter the password.",
+        "암호가 걸린 압축 파일입니다. 암호를 입력하세요.",
+    ),
+    (
+        "This archive is encrypted. A password is required.",
+        "암호가 걸린 압축 파일입니다. 암호가 필요합니다.",
+    ),
+    ("The password is incorrect.", "암호가 틀렸습니다."),
+    (
+        "The password is incorrect. Try again.",
+        "암호가 틀렸습니다. 다시 입력하세요.",
+    ),
+    (
+        "Passwords and volumes are available for ZIP and 7Z.",
+        "암호와 분할 압축은 ZIP과 7Z에서만 쓸 수 있습니다.",
+    ),
+    // Split volumes
+    ("Split into volumes", "분할 압축"),
+    ("Volume size:", "볼륨 크기:"),
+    ("10 MB", "10 MB"),
+    ("100 MB", "100 MB"),
+    ("700 MB (CD)", "700 MB (CD)"),
+    ("4 GB (FAT32)", "4 GB (FAT32)"),
+    ("Custom", "직접 입력"),
+    ("Split archive", "분할 압축 파일"),
+    ("Volume {name} is missing.", "{name} 볼륨이 없습니다."),
+    (
+        "Volume {name} may be missing.",
+        "{name} 볼륨이 없는 것 같습니다.",
+    ),
+    (
+        "Split archives cannot be changed. Extract the files and create a new archive instead.",
+        "분할 압축 파일은 고칠 수 없습니다. 압축을 푼 뒤 새로 압축하세요.",
+    ),
+    (
+        "The split ZIP archive is damaged.",
+        "분할 ZIP 압축 파일이 손상되었습니다.",
+    ),
+    (
+        "Split ZIP64 archives are not supported.",
+        "분할된 ZIP64 압축 파일은 지원하지 않습니다.",
+    ),
+    // Read-only formats and errors
+    ("Read-only format", "읽기 전용 형식"),
+    (
+        "RAR, ALZ and EGG archives are read-only. Extract the files and create a new archive to change them.",
+        "RAR, ALZ, EGG는 읽기 전용 형식입니다. 파일을 바꾸려면 압축을 푼 뒤 새로 압축하세요.",
+    ),
+    (
+        "{name}: compression method {m} is not supported.",
+        "{name}: {m} 압축 방식은 지원하지 않습니다.",
+    ),
+    ("The archive is incomplete.", "압축 파일이 중간에 잘렸습니다."),
+    ("Cancelled.", "취소했습니다."),
+    (
+        "The operation failed unexpectedly.",
+        "작업 중에 예기치 않은 오류가 발생했습니다.",
+    ),
+    ("{done} / {total} file(s)", "파일 {done} / {total}개"),
 ];
 
 #[cfg(test)]
@@ -270,9 +342,12 @@ mod tests {
     /// String literals passed to tr()/trf() in the given source.
     fn used_keys(src: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for pat in ["tr(\"", "trf(\""] {
+        // Also catches a literal on the next line: trf(\n    "...".
+        for pat in ["tr(", "trf("] {
             for (i, _) in src.match_indices(pat) {
-                let rest = &src[i + pat.len()..];
+                let Some(rest) = src[i + pat.len()..].trim_start().strip_prefix('"') else {
+                    continue;
+                };
                 let end = rest.find('"').unwrap();
                 out.push(rest[..end].replace("\\n", "\n"));
             }

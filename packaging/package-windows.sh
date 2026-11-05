@@ -18,6 +18,6 @@ cd $PK
 SETUP="$DIST/tailzip-$VER-windows-x64-setup.exe"
 makensis -V2 -DVERSION=$VER -DSRC=$(dirname $EXE) -DOUT="$SETUP" tailzip.nsi
 # portable zip as well
-Z=$(mktemp -d); mkdir -p $Z/tailzip; cp $EXE $ROOT/README.md $ROOT/LICENSE $Z/tailzip/
+Z=$(mktemp -d); mkdir -p $Z/tailzip; cp $EXE $ROOT/README.md $ROOT/LICENSE $ROOT/THIRD_PARTY_NOTICES.md $Z/tailzip/
 (cd $Z && /usr/bin/zip -qr "$DIST/tailzip-$VER-windows-x64-portable.zip" tailzip); rm -rf $Z
 ls -la "$SETUP" "$DIST/tailzip-$VER-windows-x64-portable.zip"
